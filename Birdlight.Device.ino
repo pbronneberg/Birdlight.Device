@@ -1,11 +1,11 @@
 /* BirdLight
 Daytime simulation for Bird cages
-Hardware: Arduino + I2C 16x4 LCD + SPI DS1302 + BD509 Transistors
+Hardware: Arduino + I2C 16x4 LCD + I2C DS3231 (3.3V!) + Shift registers + 74HC4066 Analog switches + FDN339 MosFets
 
 Uses a 12bit logarithmic LUT for gently increasing / decreasing brightness during
 Day to night and night to day transitions. 
 
-Copyright 2013 - Patrick Bronneberg
+Copyright 2013 - 2017 Patrick Bronneberg
 
 This sketch is free software; you can redistribute it and/or
 modify it under the terms of the GNU Lesser General Public
@@ -22,7 +22,7 @@ Lesser General Public License for more details.
 #include <Wire.h>
 #include <LCD.h>
 #include <LiquidCrystal_I2C.h>  // F Malpartida's NewLiquidCrystal library
-#include <DS1302.h>
+#include <ds3231.h>
 #include <SoftTimer.h>
 #include <SoftPwmTask.h>
 #include <PciManager.h>
@@ -79,7 +79,6 @@ const int lutSize = sizeof(PWMLut)/2;
 
 /*-----( Declare objects )-----*/  
 LiquidCrystal_I2C  lcd(LCD_I2C_ADDR,2,1,0,4,5,6,7);
-DS1302 rtc(3, 4, 5); //Real Time Clock on pins 3,4,5 (SPI)
 
 // 20 minutes, 70% transition, 168 LUT steps --> (20 * 60 * 1000) / (0.7 * 168)
 Task dayToNightTask(10000, dayToNightTransition);
@@ -151,12 +150,12 @@ void OnSetDateTime()
   }
 }
 
-//Set datetime based on following format: 7-20140706-161201 (7 is sunday, 1 is monday)
+//Set datetime based on following format: SetDateTime("7-20140706-161201") (7 is sunday, 1 is monday)
 boolean SetDateTime(String dtString)
 {
-  //if (dtString.length() == 0) { return false;}
-  
-  String dowString = dtString.substring(0, 1); // year is the first four characters
+ //if (dtString.length() == 0) { return false;}
+  struct ts t;
+  String dowString = dtString.substring(0, 1); // int for day of week (7 is sunday, 1 is monday)
   //Skip the dash
   String yearString = dtString.substring(2, 6); // year is the first four characters
   String monthString = dtString.substring(6, 8); //month is the next two characters
@@ -166,10 +165,14 @@ boolean SetDateTime(String dtString)
   String minuteString = dtString.substring(13, 15); //minute is the next two characters
   String secondString = dtString.substring(15, 17); //second is the next two characters
   
-  // The following lines can be commented out to use the values already stored in the DS1302
-  rtc.setDOW(dowString.toInt());  // Set Day-of-Week (ENUM capital english full name of the day)
-  rtc.setTime(hourString.toInt(), minuteString.toInt(), secondString.toInt());  // Set the time  (24hr format)
-  rtc.setDate(dayString.toInt(), monthString.toInt(), yearString.toInt());   // Set the date dd mm yyyy
+  t.sec = secondString.toInt();
+  t.min = minuteString.toInt();
+  t.hour = hourString.toInt();
+  t.wday = dowString.toInt();
+  t.mday = dayString.toInt();
+  t.mon = monthString.toInt();
+  t.year = yearString.toInt();
+  DS3231_set(t);
   
   return true;
 }
@@ -294,13 +297,13 @@ void setup()
 {  
   //Initialize the LED PWM
   pinMode(LED_PWM_PIN,OUTPUT); 
-  TCCR1A = (1 << COM1A1) | (1 << WGM11);                // Enable Fast PWM on OC1A (Pin 9)
-  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10);   // Mode 14 Fast PWM/ (TOP = ICR1), pre-scale = 1
-  ICR1 = PWMMax;     //Set the TOP value for 12-bit PWM
+  //TCCR1A = (1 << COM1A1) | (1 << WGM11);                // Enable Fast PWM on OC1A (Pin 9)
+  //TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10);   // Mode 14 Fast PWM/ (TOP = ICR1), pre-scale = 1
+  //ICR1 = PWMMax;     //Set the TOP value for 12-bit PWM
   
-  // Set the clock to run-mode, and disable the write protection
-  rtc.halt(false);
-  rtc.writeProtect(false);
+  // Initialize the clock
+  DS3231_init(DS3231_INTCN);
+
   
   // The following lines can be commented out to use the values already stored in the DS1302
   //rtc.setDOW(SATURDAY);        // Set Day-of-Week (ENUM capital english full name of the day)
@@ -325,6 +328,7 @@ void setup()
   
   // Startup the device
   ChangeState(STARTUP_STATE);
+  //SetDateTime("4-20161229-132801");
   
     // Listen on serial connection for messages from the PC
   Serial.begin(9600); 
@@ -413,10 +417,15 @@ int LutPercentageToLevel(double lutPercentage)
 
 void display(Task* me)
 {
-  lcd.setCursor(1,0); //Start at character 0 on line 0
-  lcd.print(rtc.getDateStr(FORMAT_SHORT,FORMAT_LITTLEENDIAN,'/'));
-  lcd.setCursor(10,0); //Start at character 0 on line 0
-  lcd.print(rtc.getTimeStr(FORMAT_SHORT));
+  struct ts time;
+  DS3231_get(&time);
+  char dateTime[15];
+  snprintf(dateTime, 15, "%02d/%02d/%02d %02d:%02d", time.mday,
+             time.mon, time.year-2000, time.hour, time.min);
+  
+  lcd.setCursor(1,0); //Start at character 1 on line 0
+  lcd.print(dateTime);
+
   
   // Process incoming serial data, and perform callbacks
   cmdMessenger.feedinSerialData();
@@ -454,7 +463,8 @@ void displayDefault(Task* me)
 
 void checkTimer(Task* me)
 { 
-  Time time = rtc.getTime();
+  struct ts time;
+  DS3231_get(&time);
   int currentLevel = 0;
   switch (currentState)
   {
@@ -547,13 +557,14 @@ void DrawStartupUI()
   lcd.setCursor(0,2); //Start at character 0 on line 2
   lcd.print(" Vogelparadijs ");  
   lcd.setCursor(0,3); //Start at character 0 on line 3
-  lcd.print(" Versie: v1.2b ");
+  lcd.print(" Versie: v3.0a ");
 }
 
 boolean CheckIsDay()
 {
   //If called the second time, transit to the correct state
-    Time time = rtc.getTime();
+    struct ts time;
+    DS3231_get(&time);
     if ((time.hour > Day_Start_Hour && time.hour < Day_End_Hour) ||
         (time.hour == Day_Start_Hour && time.min >= Day_Start_Min) ||
         (time.hour == Day_End_Hour && time.min < Day_End_Min))
@@ -570,7 +581,7 @@ void startup(Task* me)
   if (startupCalled)
   {
     //If called the second time, transit to the correct state
-    Time time = rtc.getTime();
+    
     if (CheckIsDay())
     {
       ChangeState(DAY_STATE);
